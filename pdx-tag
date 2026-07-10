@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""Bidirectional converter between PDX .gui files and a tagged block format.
+
+Tagged format replaces multi-line block braces with named markers:
+    Block_open:name  replaces {
+    Block_close:name replaces }
+
+Single-line balanced braces (e.g., `size = { 100 50 }`) are left as-is.
+Braces inside comments (`# }`) and string literals (`"}"`) are never
+treated as structure; `#` inside a string does not start a comment.
+
+Workspace: .gui_workspace/ at mod root (auto-detected via .metadata/).
+
+Usage:
+    pdx-tag open  <file.gui>        Tag and copy to workspace (round-trip verified)
+    pdx-tag save  <file> [--force]  Untag workspace file back to mod source
+                                    (refuses if brace balance would change)
+    pdx-tag list                    Show files currently in workspace
+    pdx-tag diff  <file.gui>        Diff workspace vs mod source
+    pdx-tag check <file.gui>        Verify tag/untag round-trip + brace balance
+    pdx-tag tag   <file> --stdout   Tag to stdout (no workspace)
+    pdx-tag untag <file> --stdout   Untag to stdout (no workspace)
+"""
+
+import sys
+import os
+import re
+from pathlib import Path
+
+BOM = '﻿'
+
+
+def read_text_preserve(path):
+    """Read UTF-8 (BOM-tolerant) without newline translation, so CRLF
+    files round-trip byte-exact."""
+    with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+        return f.read()
+
+
+def write_text_exact(path, content):
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        f.write(content)
+
+
+def ensure_trailing_newline(content):
+    return content if content.endswith('\n') else content + '\n'
+
+
+def find_mod_root(start: Path | None = None) -> Path:
+    """Walk up from start (or CWD) looking for .metadata/ to find mod root."""
+    p = (start or Path.cwd()).resolve()
+    while True:
+        if (p / ".metadata").is_dir():
+            return p
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    print("Error: could not find mod root (.metadata/ directory). "
+          "Run from inside a mod directory.", file=sys.stderr)
+    sys.exit(1)
+
+
+def split_line(line, in_string=False):
+    """Split a line into (code, comment, masked, in_string_after).
+
+    comment includes the leading '#' (empty string if none). masked is the
+    code part with string-literal contents blanked to spaces, same length as
+    code, so brace positions found in masked index directly into code.
+    A '#' inside a string literal does not start a comment. String state
+    carries across lines (multi-line string blobs in generated files close
+    with `"}`  — that brace IS structural, and braces inside the blob are
+    not).
+    """
+    masked = []
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_string = not in_string
+            masked.append(' ')
+        elif in_string:
+            masked.append(' ')
+        elif ch == '#':
+            return line[:i], line[i:], ''.join(masked), in_string
+        else:
+            masked.append(ch)
+    return line, '', ''.join(masked), in_string
+
+
+def scan_braces(masked):
+    """Return (unmatched_close_positions, unmatched_open_positions).
+
+    Matched pairs within the line cancel out; any unmatched closes always
+    precede any unmatched opens.
+    """
+    closes = []
+    opens = []
+    for i, ch in enumerate(masked):
+        if ch == '{':
+            opens.append(i)
+        elif ch == '}':
+            if opens:
+                opens.pop()
+            else:
+                closes.append(i)
+    return closes, opens
+
+
+def derive_block_name(line_text, parent_counters):
+    stripped = line_text.strip().rstrip('{').rstrip()
+
+    m = re.match(r'^template\s+(\w+)', stripped)
+    if m:
+        return m.group(1)
+
+    m = re.match(r'^type\s+(\w+)\s*=', stripped)
+    if m:
+        return m.group(1)
+
+    m = re.match(r'^types\s+(\w+)', stripped)
+    if m:
+        return m.group(1)
+
+    m = re.match(r'^blockoverride\s+"([^"]+)"', stripped)
+    if m:
+        clean = m.group(1).replace(' ', '_')
+        return f"bo_{clean}"
+
+    m = re.match(r'^(\w+)', stripped)
+    if m:
+        name_base = m.group(1)
+        parent_counters[name_base] = parent_counters.get(name_base, 0) + 1
+        count = parent_counters[name_base]
+        return name_base if count == 1 else f"{name_base}_{count}"
+
+    parent_counters['_anon'] = parent_counters.get('_anon', 0) + 1
+    return f"anon_{parent_counters['_anon']}"
+
+
+def get_indent(line):
+    return line[:len(line) - len(line.lstrip())] if line.strip() else line
+
+
+def tag_content(content):
+    crlf = '\r\n' in content
+    if crlf:
+        content = content.replace('\r\n', '\n')
+    lines = content.split('\n')
+    output = []
+    stack = []  # (name, indent, counters)
+    top_counters = {}
+    prev_code = ''  # code part of last non-blank line, names own-line braces
+    in_string = False
+
+    for line in lines:
+        code, comment, masked, in_string = split_line(line, in_string)
+        u_closes, u_opens = scan_braces(masked)
+
+        if not u_closes and not u_opens:
+            output.append(line)
+            if code.strip():
+                prev_code = code
+            continue
+
+        indent = get_indent(line)
+
+        if u_closes:
+            before = code[:u_closes[0]].rstrip()
+            if before.strip():
+                output.append(before)
+            for j, pos in enumerate(u_closes):
+                if j + 1 < len(u_closes):
+                    seg = code[pos + 1:u_closes[j + 1]].strip()
+                elif u_opens:
+                    seg = ''  # remainder belongs to the open handled below
+                else:
+                    seg = code[pos + 1:].strip()
+                    seg = f"{seg} {comment}".strip() if comment else seg
+                if stack:
+                    name, open_indent, _ = stack.pop()
+                    marker = f"{open_indent}Block_close:{name}"
+                else:
+                    marker = f"{indent}}}"  # unmatched close, pass through
+                output.append(f"{marker} {seg}" if seg else marker)
+
+        if u_opens:
+            start = (u_closes[-1] + 1) if u_closes else 0
+            for k, pos in enumerate(u_opens):
+                counters = stack[-1][2] if stack else top_counters
+                head = code[start:pos]
+                head_text = head.strip()
+                block_indent = indent + '\t' * k
+                # own-line brace: name it from the preceding line
+                # (`template Foo` / `{` next-line style)
+                name = derive_block_name(head if head_text else prev_code,
+                                         counters)
+                if not head_text:
+                    tagged = f"{block_indent}Block_open:{name}"
+                elif k == 0 and not u_closes:
+                    tagged = f"{head.rstrip()} Block_open:{name}"
+                else:
+                    tagged = f"{block_indent}{head_text} Block_open:{name}"
+                trailing = ''
+                if k == len(u_opens) - 1:
+                    trailing = code[pos + 1:].strip()
+                    trailing = f"{trailing} {comment}".strip() if comment else trailing
+                if trailing:
+                    tagged = f"{tagged} #{trailing}"
+                output.append(tagged)
+                stack.append((name, block_indent, {}))
+                start = pos + 1
+
+        if code.strip():
+            prev_code = code
+
+    result = '\n'.join(output)
+    return result.replace('\n', '\r\n') if crlf else result
+
+
+CLOSE_RE = re.compile(r'^(\s*)Block_close:\S+(?:\s+(.*))?$')
+OPEN_LINE_RE = re.compile(r'^(\s*)Block_open:\S+(?:\s+#(.+))?$')
+OPEN_RE = re.compile(r' Block_open:\S+\s+#(.+)')
+
+
+def untag_content(content):
+    crlf = '\r\n' in content
+    if crlf:
+        content = content.replace('\r\n', '\n')
+    lines = content.split('\n')
+    output = []
+
+    for line in lines:
+        m = CLOSE_RE.match(line)
+        if m:
+            indent, rest = m.group(1), m.group(2)
+            output.append(f"{indent}}} {rest}" if rest else f"{indent}}}")
+            continue
+        m = OPEN_LINE_RE.match(line)
+        if m:  # own-line brace form: marker directly at indent
+            indent, rest = m.group(1), m.group(2)
+            output.append(f"{indent}{{ {rest}" if rest else f"{indent}{{")
+            continue
+        code = split_line(line)[0]
+        if ' Block_open:' in code:  # markers in comments/strings stay as-is
+            idx = line.index(' Block_open:')
+            prefix = line[:idx]
+            m = OPEN_RE.match(line[idx:])
+            if m:
+                output.append(f"{prefix} {{ {m.group(1)}")
+            else:
+                output.append(f"{prefix} {{")
+            continue
+        output.append(line)
+
+    result = '\n'.join(output)
+    return result.replace('\n', '\r\n') if crlf else result
+
+
+def _tokens(content):
+    return content.replace('{', ' { ').replace('}', ' } ').split()
+
+
+def verify_roundtrip(content):
+    """Return None if untag(tag(content)) preserves the token stream,
+    else a description of the first divergence."""
+    rt = untag_content(tag_content(content))
+    a, b = _tokens(content), _tokens(rt)
+    if a == b:
+        return None
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            ctx = ' '.join(a[max(0, i - 4):i + 1])
+            return f"first divergence at token {i}: source {x!r} vs round-trip {y!r} (near: ...{ctx})"
+    return f"token count differs: source {len(a)} vs round-trip {len(b)}"
+
+
+def structural_balance(content):
+    """Net open-minus-close brace count, ignoring comments and strings."""
+    net = 0
+    in_string = False
+    for line in content.split('\n'):
+        _, _, masked, in_string = split_line(line, in_string)
+        net += masked.count('{') - masked.count('}')
+    return net
+
+
+def resolve_mod_path(mod_root, filepath):
+    p = Path(filepath)
+    if p.is_absolute():
+        return p
+    return mod_root / p
+
+
+def workspace_path_for(mod_root, mod_file):
+    ws = mod_root / ".gui_workspace"
+    rel = mod_file.relative_to(mod_root)
+    return ws / (str(rel) + '.tagged')
+
+
+def mod_path_from_workspace(mod_root, ws_file):
+    ws = mod_root / ".gui_workspace"
+    rel = ws_file.relative_to(ws)
+    mod_rel = str(rel)
+    if mod_rel.endswith('.tagged'):
+        mod_rel = mod_rel[:-7]
+    return mod_root / mod_rel
+
+
+def cmd_open(mod_root, filepath):
+    mod_file = resolve_mod_path(mod_root, filepath)
+    if not mod_file.exists():
+        print(f"Error: {mod_file} not found", file=sys.stderr)
+        sys.exit(1)
+
+    raw = mod_file.read_bytes()
+    has_bom = raw.startswith(b'\xef\xbb\xbf')
+    content = read_text_preserve(mod_file)
+
+    problem = verify_roundtrip(content)
+    if problem:
+        print(f"Error: tag/untag round-trip is NOT faithful for this file; "
+              f"refusing to open.\n  {problem}", file=sys.stderr)
+        sys.exit(1)
+
+    tagged = tag_content(content)
+    tagged = ensure_trailing_newline(tagged)
+    if has_bom:
+        tagged = BOM + tagged
+
+    ws_path = workspace_path_for(mod_root, mod_file)
+    ws_path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_exact(ws_path, tagged)
+
+    rel_ws = ws_path.relative_to(mod_root)
+    rel_mod = mod_file.relative_to(mod_root)
+    print(f"Opened: {rel_mod} → {rel_ws} (round-trip verified)")
+
+
+def marker_debris(content):
+    """First line whose code part (not comments/strings) still contains a
+    Block_ marker or near-miss, or None."""
+    in_string = False
+    for line in content.split('\n'):
+        code, _, _, in_string = split_line(line, in_string)
+        if 'Block_' in code:
+            return line.strip()
+    return None
+
+
+def cmd_save(mod_root, filepath, force=False):
+    p = Path(filepath)
+    ws = mod_root / ".gui_workspace"
+
+    if p.suffix == '.gui' or (not str(p).endswith('.tagged')):
+        mod_file = resolve_mod_path(mod_root, p)
+        ws_file = workspace_path_for(mod_root, mod_file)
+    else:
+        if p.is_absolute():
+            ws_file = p
+        else:
+            ws_file = ws / p if not (mod_root / p).exists() else mod_root / p
+
+    if not ws_file.exists():
+        print(f"Error: workspace file not found: {ws_file}", file=sys.stderr)
+        sys.exit(1)
+
+    mod_file = mod_path_from_workspace(mod_root, ws_file)
+    content = read_text_preserve(ws_file)
+    result = untag_content(content)
+    result = ensure_trailing_newline(result)
+
+    rel_ws = ws_file.relative_to(mod_root)
+
+    debris = marker_debris(result)
+    if debris:
+        print("Error: untagged output still contains Block_ marker text in a "
+              "code position (malformed marker line in workspace?); refusing "
+              f"to save.\n  offending line: {debris!r}\n"
+              f"  fix the workspace file and retry: {rel_ws}", file=sys.stderr)
+        sys.exit(1)
+
+    net = structural_balance(result)
+    old_net = (structural_balance(read_text_preserve(mod_file))
+               if mod_file.exists() else 0)
+    if net != old_net and not force:
+        print(f"Error: save would change the file's brace balance "
+              f"({old_net:+d} → {net:+d}) — mismatched Block_open/Block_close "
+              f"markers in the workspace. Refusing to save.\n"
+              f"  fix the workspace file and retry: {rel_ws}\n"
+              f"  or pass --force to save anyway.", file=sys.stderr)
+        sys.exit(1)
+
+    has_bom = mod_file.exists() and mod_file.read_bytes().startswith(b'\xef\xbb\xbf')
+    if has_bom:
+        result = BOM + result
+
+    write_text_exact(mod_file, result)
+
+    rel_mod = mod_file.relative_to(mod_root)
+    print(f"Saved: {rel_ws} → {rel_mod}")
+
+    if net != old_net:
+        print(f"WARNING: saved with --force; brace balance changed "
+              f"{old_net:+d} → {net:+d}. Workspace file kept: {rel_ws}",
+              file=sys.stderr)
+        return
+
+    ws_file.unlink()
+    try:
+        ws_file.parent.rmdir()
+    except OSError:
+        pass
+
+
+def cmd_list(mod_root):
+    ws = mod_root / ".gui_workspace"
+    if not ws.exists():
+        print("Workspace is empty.")
+        return
+
+    files = sorted(ws.rglob('*.tagged'))
+    if not files:
+        print("Workspace is empty.")
+        return
+
+    print(f"Workspace ({len(files)} files):")
+    for f in files:
+        rel = f.relative_to(mod_root)
+        mod_file = mod_path_from_workspace(mod_root, f)
+        mod_rel = mod_file.relative_to(mod_root)
+        print(f"  {rel}  ←  {mod_rel}")
+
+
+def cmd_diff(mod_root, filepath):
+    import subprocess
+    import tempfile
+
+    mod_file = resolve_mod_path(mod_root, filepath)
+    ws_file = workspace_path_for(mod_root, mod_file)
+
+    if not ws_file.exists():
+        print(f"No workspace file for {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    ws_raw = ws_file.read_bytes()
+    has_bom = ws_raw.startswith(b'\xef\xbb\xbf')
+    ws_content = read_text_preserve(ws_file)
+    untagged = untag_content(ws_content)
+    untagged = ensure_trailing_newline(untagged)
+    if has_bom:
+        untagged = BOM + untagged
+
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.gui', delete=False) as tmp:
+        tmp.write(untagged.encode('utf-8'))
+        tmp_path = tmp.name
+
+    try:
+        result = subprocess.run(
+            ['diff', '-u', str(mod_file), tmp_path],
+            capture_output=True, text=True
+        )
+        if result.stdout:
+            print(result.stdout)
+        else:
+            print("No differences.")
+    finally:
+        os.unlink(tmp_path)
+
+
+def cmd_check(filepath):
+    p = Path(filepath)
+    if not p.exists():
+        print(f"Error: {p} not found", file=sys.stderr)
+        sys.exit(1)
+    content = read_text_preserve(p)
+    net = structural_balance(content)
+    problem = verify_roundtrip(content)
+    print(f"{p}:")
+    print(f"  brace balance: {'OK' if net == 0 else f'UNBALANCED (net {net:+d})'}")
+    print(f"  round-trip:    {'OK' if problem is None else 'FAILED — ' + problem}")
+    if net != 0 or problem:
+        sys.exit(1)
+
+
+def read_input(filepath):
+    if str(filepath) in ('-', '/dev/stdin'):
+        return sys.stdin.buffer.read().decode('utf-8-sig')
+    return read_text_preserve(Path(filepath))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command in ('tag', 'untag'):
+        if len(sys.argv) < 3:
+            print(f"Usage: pdx-tag {command} <file> --stdout", file=sys.stderr)
+            sys.exit(1)
+        content = read_input(sys.argv[2])
+        if command == 'tag':
+            problem = verify_roundtrip(content)
+            if problem:
+                print(f"WARNING: tag/untag round-trip is not faithful: {problem}",
+                      file=sys.stderr)
+            result = tag_content(content)
+        else:
+            result = untag_content(content)
+        sys.stdout.write(ensure_trailing_newline(result))
+        return
+
+    if command == 'check':
+        if len(sys.argv) < 3:
+            print("Usage: pdx-tag check <file.gui>", file=sys.stderr)
+            sys.exit(1)
+        cmd_check(sys.argv[2])
+        return
+
+    mod_root = find_mod_root()
+
+    if command == 'open':
+        if len(sys.argv) < 3:
+            print("Usage: pdx-tag open <file.gui>", file=sys.stderr)
+            sys.exit(1)
+        cmd_open(mod_root, sys.argv[2])
+
+    elif command == 'save':
+        args = [a for a in sys.argv[2:] if a != '--force']
+        if not args:
+            print("Usage: pdx-tag save <file> [--force]", file=sys.stderr)
+            sys.exit(1)
+        cmd_save(mod_root, args[0], force='--force' in sys.argv[2:])
+
+    elif command == 'list':
+        cmd_list(mod_root)
+
+    elif command == 'diff':
+        if len(sys.argv) < 3:
+            print("Usage: pdx-tag diff <file.gui>", file=sys.stderr)
+            sys.exit(1)
+        cmd_diff(mod_root, sys.argv[2])
+
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
