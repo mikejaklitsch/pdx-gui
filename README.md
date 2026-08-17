@@ -1,6 +1,6 @@
-# pdx-tag
+# pdx-gui
 
-Bidirectional converter between Paradox `.gui` files and a tagged block format. Large `.gui` files are hard to edit safely because one misplaced brace corrupts everything after it, and braces also appear inside comments and string literals where they are not structure. pdx-tag replaces every multi-line block brace with a named marker pair, so blocks can be read, extracted, and edited by name instead of by brace counting, then converts the file back losslessly.
+Bidirectional converter between Paradox `.gui` files and a tagged block format. Large `.gui` files are hard to edit safely because one misplaced brace corrupts everything after it, and braces also appear inside comments and string literals where they are not structure. pdx-gui replaces every multi-line block brace with a named marker pair, so blocks can be read, extracted, and edited by name instead of by brace counting, then converts the file back losslessly.
 
 The tagged format:
 
@@ -17,7 +17,7 @@ Single-line balanced braces like `size = { 100 50 }` are left alone. The scanner
 Self-contained Python script, no dependencies. Symlink it onto your PATH:
 
 ```bash
-ln -s "$(pwd)/pdx-tag" ~/.local/bin/pdx-tag
+ln -s "$(pwd)/pdx-gui" ~/.local/bin/pdx-gui
 ```
 
 ## Usage
@@ -25,14 +25,14 @@ ln -s "$(pwd)/pdx-tag" ~/.local/bin/pdx-tag
 The workspace is a `.gui_workspace/` directory at the mod root, found automatically via the mod's `.metadata/` directory. Run commands from anywhere inside the mod.
 
 ```bash
-pdx-tag open  file.gui           # tag the file and copy it into the workspace
-pdx-tag save  file.gui           # untag the workspace copy back over the mod source
-pdx-tag save  file.gui --force   # save even if the net brace balance changed
-pdx-tag list                     # show files currently open in the workspace
-pdx-tag diff  file.gui           # diff workspace copy against the mod source
-pdx-tag check file.gui           # report round-trip fidelity and brace balance
-pdx-tag tag   file.gui --stdout  # tag to stdout, no workspace
-pdx-tag untag file.tagged --stdout
+pdx-gui open  file.gui           # tag the file and copy it into the workspace
+pdx-gui save  file.gui           # untag the workspace copy back over the mod source
+pdx-gui save  file.gui --force   # save even if the net brace balance changed
+pdx-gui list                     # show files currently open in the workspace
+pdx-gui diff  file.gui           # diff workspace copy against the mod source
+pdx-gui check file.gui           # report round-trip fidelity and brace balance
+pdx-gui tag   file.gui --stdout  # tag to stdout, no workspace
+pdx-gui untag file.tagged --stdout
 ```
 
 The editing loop is: `open`, edit the `.tagged` file in the workspace, `save`. The mod's `.gui` files stay canonical; the workspace is scratch space and is cleaned up on save.
