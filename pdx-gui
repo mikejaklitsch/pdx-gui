@@ -46,6 +46,34 @@ def ensure_trailing_newline(content):
     return content if content.endswith('\n') else content + '\n'
 
 
+TAB_WIDTH = 4
+
+
+def detab(content):
+    """Replace leading tabs with spaces so agents can Edit the workspace."""
+    lines = content.split('\n')
+    out = []
+    for line in lines:
+        n = 0
+        while n < len(line) and line[n] == '\t':
+            n += 1
+        out.append(' ' * (n * TAB_WIDTH) + line[n:])
+    return '\n'.join(out)
+
+
+def entab(content):
+    """Restore leading spaces to tabs on save."""
+    lines = content.split('\n')
+    out = []
+    for line in lines:
+        n = 0
+        while n < len(line) and line[n] == ' ':
+            n += 1
+        tabs, leftover = divmod(n, TAB_WIDTH)
+        out.append('\t' * tabs + ' ' * leftover + line[n:])
+    return '\n'.join(out)
+
+
 def find_mod_root(start: Path | None = None) -> Path:
     """Walk up from start (or CWD) looking for .metadata/ to find mod root."""
     p = (start or Path.cwd()).resolve()
@@ -322,6 +350,7 @@ def cmd_open(mod_root, filepath):
         sys.exit(1)
 
     tagged = tag_content(content)
+    tagged = detab(tagged)
     tagged = ensure_trailing_newline(tagged)
     if has_bom:
         tagged = BOM + tagged
@@ -332,7 +361,7 @@ def cmd_open(mod_root, filepath):
 
     rel_ws = ws_path.relative_to(mod_root)
     rel_mod = mod_file.relative_to(mod_root)
-    print(f"Opened: {rel_mod} → {rel_ws} (round-trip verified)")
+    print(f"Opened: {rel_mod} → {rel_ws} (round-trip verified, tabs expanded)")
 
 
 def marker_debris(content):
@@ -365,6 +394,7 @@ def cmd_save(mod_root, filepath, force=False):
 
     mod_file = mod_path_from_workspace(mod_root, ws_file)
     content = read_text_preserve(ws_file)
+    content = entab(content)
     result = untag_content(content)
     result = ensure_trailing_newline(result)
 
