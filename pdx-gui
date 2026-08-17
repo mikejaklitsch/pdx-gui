@@ -22,28 +22,16 @@ Usage:
     pdx-gui untag <file> --stdout   Untag to stdout (no workspace)
 """
 
-import sys
 import os
+import sys
 import re
 from pathlib import Path
 
-BOM = '﻿'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-
-def read_text_preserve(path):
-    """Read UTF-8 (BOM-tolerant) without newline translation, so CRLF
-    files round-trip byte-exact."""
-    with open(path, 'r', encoding='utf-8-sig', newline='') as f:
-        return f.read()
-
-
-def write_text_exact(path, content):
-    with open(path, 'w', encoding='utf-8', newline='') as f:
-        f.write(content)
-
-
-def ensure_trailing_newline(content):
-    return content if content.endswith('\n') else content + '\n'
+from pdx_common.fileio import BOM, read_text_preserve, write_text_exact, ensure_trailing_newline  # noqa: E402
+from pdx_common.paths import find_mod_root_or_exit  # noqa: E402
+from pdx_common.scanner import split_line, structural_balance  # noqa: E402
 
 
 TAB_WIDTH = 4
@@ -74,44 +62,6 @@ def entab(content):
     return '\n'.join(out)
 
 
-def find_mod_root(start: Path | None = None) -> Path:
-    """Walk up from start (or CWD) looking for .metadata/ to find mod root."""
-    p = (start or Path.cwd()).resolve()
-    while True:
-        if (p / ".metadata").is_dir():
-            return p
-        parent = p.parent
-        if parent == p:
-            break
-        p = parent
-    print("Error: could not find mod root (.metadata/ directory). "
-          "Run from inside a mod directory.", file=sys.stderr)
-    sys.exit(1)
-
-
-def split_line(line, in_string=False):
-    """Split a line into (code, comment, masked, in_string_after).
-
-    comment includes the leading '#' (empty string if none). masked is the
-    code part with string-literal contents blanked to spaces, same length as
-    code, so brace positions found in masked index directly into code.
-    A '#' inside a string literal does not start a comment. String state
-    carries across lines (multi-line string blobs in generated files close
-    with `"}`  — that brace IS structural, and braces inside the blob are
-    not).
-    """
-    masked = []
-    for i, ch in enumerate(line):
-        if ch == '"':
-            in_string = not in_string
-            masked.append(' ')
-        elif in_string:
-            masked.append(' ')
-        elif ch == '#':
-            return line[:i], line[i:], ''.join(masked), in_string
-        else:
-            masked.append(ch)
-    return line, '', ''.join(masked), in_string
 
 
 def scan_braces(masked):
@@ -301,14 +251,6 @@ def verify_roundtrip(content):
     return f"token count differs: source {len(a)} vs round-trip {len(b)}"
 
 
-def structural_balance(content):
-    """Net open-minus-close brace count, ignoring comments and strings."""
-    net = 0
-    in_string = False
-    for line in content.split('\n'):
-        _, _, masked, in_string = split_line(line, in_string)
-        net += masked.count('{') - masked.count('}')
-    return net
 
 
 def resolve_mod_path(mod_root, filepath):
@@ -547,7 +489,7 @@ def main():
         cmd_check(sys.argv[2])
         return
 
-    mod_root = find_mod_root()
+    mod_root = find_mod_root_or_exit()
 
     if command == 'open':
         if len(sys.argv) < 3:
