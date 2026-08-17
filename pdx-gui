@@ -29,9 +29,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pdx_common.fileio import BOM, read_text_preserve, write_text_exact, ensure_trailing_newline  # noqa: E402
-from pdx_common.paths import find_mod_root_or_exit  # noqa: E402
-from pdx_common.scanner import split_line, structural_balance  # noqa: E402
+from pdx_utilities.fileio import BOM, read_text_preserve, write_text_exact, ensure_trailing_newline  # noqa: E402
+from pdx_utilities.paths import find_mod_root_or_exit  # noqa: E402
+from pdx_utilities.scanner import split_line, structural_balance  # noqa: E402
 
 
 TAB_WIDTH = 4
