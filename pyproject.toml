@@ -7,9 +7,10 @@ name = "pdx-gui"
 version = "1.0.0"
 description = "Bidirectional converter between PDX .gui files and a tagged block format"
 requires-python = ">=3.10"
+dependencies = ["pdx-utilities @ git+https://github.com/mikejaklitsch/pdx-utilities.git"]
 
 [project.scripts]
 pdx-gui = "pdx_gui.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["pdx_gui*", "pdx_utilities*"]
+include = ["pdx_gui*"]
